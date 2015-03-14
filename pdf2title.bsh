@@ -1,0 +1,245 @@
+#!/bin/bash 
+
+declare -r BASHERREXIT="-e" ## reset state if it needs to be toggled elsewhere 
+                            ## +e turns off shell error on exit, -e turns it on   
+declare -r RESTORE_NOCASEMATCH="$(shopt -p nocasematch)" 
+
+set ${BASHERREXIT}
+set -uo pipefail
+
+## This script requires the package pdinfo found in poppler-utils in apt Ubuntu/Debian.
+## $1 pdf file or directory to process 
+## $2 output directory
+## $3 name/path of rm_script.bsh 
+###  
+### Its a good idea to run this script at least twice on the same directory especially if you have a large collection of pdfs
+### to convert because this software is not smart enough to know what constitutes a POCT (piece-of-crap-title) like Title: Figure. 24a 
+### until it collides with another POCT   
+### 
+### TODO: 
+### sync to disk logic and frequency e.g. every 100 files or every 100 MB then sync to disk after md5 check  
+### additionally, creating signature files for known bad titles by software would be good (known culprits) 
+### externalizing the settings and creating a config file 
+### move the options into real options 
+### create man page 
+### create a wrapper script 
+### add archiving (rar, tar, zip)  
+### create default directories (logs, scripts, failed files, renamed) 
+### 
+
+declare OLDNAME=""
+declare NEWNAME=""
+declare TITLE=""
+declare -i MD5ERROR=0
+declare -i SKIPCOPY=0
+declare -i TITLELENGTH=75 ##hardcoded need to go change it and then change this to reflect it.. for now
+declare OUTDIR=${2:-$(pwd)}
+        OUTDIR=$(echo "$OUTDIR" | sed "s#^[^/]#$(pwd)/&#;s/\.$//") ## full qualify paths 
+declare LOGFILE=${4:-${OUTDIR}}
+        LOGFILE=$(echo "$LOGFILE" | sed "s#^[^/]#$(pwd)/&#;s/\.$//") ## full qualify paths 
+        LOGFILE="${LOGFILE%/}/pdf2title_logfile_$$_$(date +'%Y%m%d%H%M%S').txt"
+#declare RMSCRIPT=${3:-${OUTDIR%/}/pdf2title_rm_script_$$_$(date +'%Y%m%d%H%M%S').bsh}
+declare RMSCRIPT=${3:-${OUTDIR}}
+        RMSCRIPT=$(echo "$RMSCRIPT" | sed "s#^[^/]#$(pwd)/&#;s/\.$//") ## full qualify paths 
+        RMSCRIPT="${RMSCRIPT%/}/pdf2title_rm_script_$$_$(date +'%Y%m%d%H%M%S').bsh"
+declare SUFFIX=".pdf" 
+declare -r COPYCMD="cp -nv" 
+declare -r RMCMD="rm -v" 
+declare -r DOCVIEWER="/usr/bin/geany"
+declare -r BANNERCMD="/usr/bin/figlet"
+declare CHKMD5MSG=""
+
+function print_usage() { 
+ echo "Usage: ren_pdf2title <file|directory|--help> [<cp dir>] [<rm dir>] [<log dir>]"  
+} 
+
+function print_help() { 
+cat <<  EOF
+ren_pdf2title: Uses the utility pdfinfo to parse a pdf file for its meta database 
+               and renames the file using the Title or substring of the Title. 
+               
+               This utility will *not* automatically delete the old pdf files, it will 
+               generate a rm script that will and you can review it prior to executing. 
+               
+               In addition, this utility will check md5 sums to make sure that no file 
+               is clobbered and that all files are copied over successfully.    
+                
+Usage: ren_pdf2title <file|directory|--help> [<cp dir>] [<rm dir>] [<log dir>]  
+      file: name of a single pdf file (may include fully qualified path)   
+ directory: name of directory that contains pdf files to be renamed (all are processed)
+    cp dir: optional arg, name of dir to copy renamed pdf files to (default: pwd) 
+    rm dir: optional arg, name of dir to put script to rm old pdfs (default: pwd) 
+   log dir: optional arg, name of dir to put log file of run (default: pwd) 
+    --help: detailed help message 
+    
+Eg. ren_pdf2title /tmp/234972842.pdf 
+     generates a new pdf file e.g. A_SENSIBLE_REAL_PDF_TITLE.pdf in pwd  
+     generates a new logfile pdf2title_logfile_<uniq id>.txt
+     generates a new rm script entitled pdf2title_rm_script_<uniq id>.bsh 
+    
+    After you should review both the log file and rm script to make sure that  
+    everything is processed as expected. 
+    
+    Then if you want you can execute the rm script to clean up the old pdf files. 
+    
+    Done!   
+
+Requirements: pdfinfo, pdftohtml (found in poppler-utils, e.g. apt-get install poppler-utils) 
+              html2text 
+EOF
+grace_exit 
+}
+
+function create_rm_script() { 
+ echo "#!/usr/bin/env bash" >> "$RMSCRIPT" 
+ echo "set -euo pipefail"   >> "$RMSCRIPT" 
+}  
+
+function chmod_rm_script() { 
+ [[ -f "$RMSCRIPT" ]] && chmod +x "$RMSCRIPT" 
+ : ## magic no-op command, to give bash proper flow through or bash will exit on above command 
+} 
+
+function get_ocr_title() { 
+  ## first remove the path 
+ local FILENAME="${1##*/}"       ## get the file part if its fully qualified 
+ local TMPDIR="$(pwd)/_$$_${FILENAME%.pdf}" ## truncate off the .pdf extension if its there 
+ (umask 077 && mkdir "$TMPDIR") ## for safety against symlink attack, umask only exists for subshell 
+ cp "$1" "$TMPDIR/"
+ ## First convert pdf to html, -f 1 -l 1 -i  
+ ## start at page 1 (-f 1) last page 1 (-l 1) and ignore images (-i)  
+ ERRORESULT=$(pdftohtml -f 1 -l 1 -i "$TMPDIR/$FILENAME" 2>&1 | grep -c 'PDF.*damaged')
+ if ((! $ERRORESULT)); then     
+	  ## This is a filter to parse the html file that is OCR'd, for now the logic in a nutshell is to change all newline to spaces
+	  ## creating one big string then remove special characters, remove double spaces, cut it down to 250 and jump over the first 
+	  ## occurence of the word Latex since some authors put a little tag at the top that states that the document is built with Latex
+	  ## this causes duplicate file names if you leave the file name short and anyway makes for less meaningful file name. 
+	  ## Your data set will vary so, this statement will need to be modified and adjusted accordingly  
+      ## LANG=C sed 's/[\x80-\xFF]//g' strips out multibyte characters, the LANG=C (or other) is essential  
+      ## sed 's/[^a-Z0-9 .-\_]*/ /g' rids all single byte characters except for a-z, A-Z, 0-9, ., -, _ or a blank space 
+      ## if you see sed throw an "Invalid range end" it probably means your LANG variable is no good, try setting it to en_US.UTF-8 (export LANG=en_US.UTF-8)    
+   OCRTITLE=$(html2text <(cat "$TMPDIR/${FILENAME%.pdf}"s.html | head -20) | tr '\n' ' ' | sed 's/[^a-Z0-9_-]/ /g' | LANG=C sed 's/[\x80-\xFF]//g' | tr -s ' ' | sed 's/ /_/g' | cut -c -250 | sed 's/\(^.*[lL][aA][Tt][eE][Xx]\)\(.*\)/\2/g' | cut -c -75 | sed 's/^_//;s/_$//')
+#  OCRTITLE=$(html2text <(cat "${1%.pdf}"s.html | head -20) | tr '\n' ' ' | sed 's/[^a-Z0-9_-]/ /g' | tr -s ' ' | sed 's/ /_/g' | cut -c -250 | sed 's/\(^.*[lL][aA][Tt][eE][Xx]\)\(.*\)/\2/g' | cut -c -75 | sed 's/^_//;s/_$//')
+# OCRTITLE=$(html2text <(cat "${1%.pdf}"s.html | head -20) | tr '\n' ' ' | sed 's/[^a-Z0-9_-]/ /g' | tr -s ' ' | cut -c -75 | sed 's/ /_/g')  
+# OCRTITLE=$(html2text <(cat "${1%.pdf}"s.html | head -15) | cut -c -75 | sed 's/[^a-Z0-9_-]/ /g' | tr -s ' ' | sed 's/ /_/g')
+ else 
+  OCRTITLE="** ERROR Processing File $1 - Title could not be determined."
+ fi  
+ rm  "$TMPDIR"/*
+ rmdir  "$TMPDIR/" 
+ echo "$OCRTITLE" 
+} 
+
+function grace_exit() { 
+ chmod_rm_script
+ [[ -f "$LOGFILE" ]] && "$DOCVIEWER" "$LOGFILE"
+ [[ -f "$RMSCRIPT" ]] && "$DOCVIEWER" "$RMSCRIPT" 
+ sync; ## sync disk, in case we are on external storage w/out sync mount option
+ exit 0; 
+} 
+
+function write_log() { 
+ echo "$1" >> "$LOGFILE"
+} 
+
+function write_rm() { 
+ [[ ! -f "$RMSCRIPT" ]] && create_rm_script 
+ echo "$1" >> "$RMSCRIPT" 
+} 
+
+function chk_md5() { 
+ OLD_FILE="$1"
+ NEW_FILE="$2" 
+ local -i ERROR_FLAG=0 
+ local OLD_MD5=""
+ local NEW_MD5=""
+ read OLD_MD5 _ < <(md5sum "$OLD_FILE")
+  ## Need to check error return codes since the command subsitution will yield null on error 
+  ## and the test [[ "" -eq "anything" ]] will always return true, we need that to fail too.  
+ (($?)) && ERROR_FLAG=1 
+ read NEW_MD5 _ < <(md5sum "$NEW_FILE") 
+ (($?)) && ERROR_FLAG=1 
+ SUCCESSMSG="Successfully Copied: $OLD_FILE ($OLD_MD5) ==> $NEW_FILE ($NEW_MD5) ..."
+ FAILMSG="** FAILED COPY **- MISMATCHING MD5 SUMS : $OLD_FILE ($OLD_MD5)  ==> $NEW_FILE ($NEW_MD5)"
+  ## use == for strings, single ['s to avoid any fancy interpretations, righthand side otherwise will be escaped
+ if [ "$NEW_MD5" == "$OLD_MD5" ] &&  ((! $ERROR_FLAG)); then 
+  CHKMD5MSG="$SUCCESSMSG" 
+ else 
+  MD5ERROR=1
+  CHKMD5MSG="$FAILMSG" 
+ fi
+} 
+
+function process_file() { 
+ OLDNAME="$1"
+  ## First try the meta data for a well behaved document w/Title info    
+  ## Note the space below TITLE=$( ( do not change, we want to subshell to avoid pdfinfo exiting our    
+  ## script not make bash evaluate as an arithmetic expression e.g. ((5+1)) 
+ set +e 
+ TITLE=$( (pdfinfo -box "$OLDNAME" 2>&1)) 
+ ERRORCODE=$? 
+ set ${BASHERREXIT} 
+ (( ! $ERRORCODE )) && TITLE=$(echo "$TITLE" | awk '/Title/{$1="";var=substr($0,0,75); gsub("[^a-Z ]|^ ","",var); gsub("[ ]+","_",var); print var}' 2>/dev/random) && NEWNAME="${OUTDIR%/}/${TITLE}$SUFFIX"
+ 
+# TITLE=$( (pdfinfo -box "$OLDNAME" 2>&1) | awk '/Title/{$1="";var=substr($0,0,75); gsub("[^a-Z ]|^ ","",var); gsub("[ ]+","_",var); print var}' 2>/dev/random)
+  ## If its empty or if it has the title of Arxiv, a common meaningless title from Cornell arXiv archive 
+ ## The test for [[ -f "$NEWNAME" ]] limits us to one collision on software mass produced meta Title strings after one file is renamed according to it 
+ ## all subsequent occurrences will collide and force the OCR search for title based on text and will usually yield a unique title.   
+ shopt -s nocasematch 
+ [[ -z "$TITLE" ]] || [[ "$TITLE" =~ "arXiv" ]] || [[ "$TITLE" =~ "PDF file is damaged" ]] || [[ -f "$NEWNAME" ]] && TITLE=$(get_ocr_title "$OLDNAME") && NEWNAME="${OUTDIR%/}/${TITLE}$SUFFIX"
+ $RESTORE_NOCASEMATCH
+ 
+  ## If ocr_title couldn't find a title log it and abort  
+ [[ "$TITLE" =~ "** ERROR Processing File" ]] &&  write_log "$TITLE" &&  SKIPCOPY=1 
+
+    ## ${OUTDIR%/} first rid the / in case the user has provided, then we know its safe to add / 
+# NEWNAME="${OUTDIR%/}/${TITLE}$SUFFIX"
+  ## file already exists, check the md5 sums      
+ if [[ -f "$NEWNAME" ]] && ((! $SKIPCOPY )); then 
+    #### for now skip copying no matter what, since partial titles may be non uniq, its not worth the risk of 
+    #### automagically clobbering tons of important pdf files, we'll look at them by hand 
+  SKIPCOPY=1 
+  chk_md5 "$OLDNAME" "$NEWNAME"
+  CHKMD5MSG="File Already Exists, $CHKMD5MSG"
+  ## if md5's don't match then report it for further review 
+   ##(($MD5ERROR)) && write_log "$CHKMD5MSG" 
+   ##this logic was for the case of special processing of non-matching md5s 
+   ##where we want to have an extra message written prior to the file copy message 
+   ##regarding that we found a mismatch md5 sum 
+ fi     
+ 
+ ## if file doesnt yet exist 
+ if ((! $SKIPCOPY )); then 
+  $COPYCMD "$OLDNAME" "$NEWNAME"  
+  chk_md5 "$OLDNAME" "$NEWNAME"
+  if ((! $MD5ERROR )); then   
+   write_rm "## $CHKMD5MSG" 
+   write_rm "$RMCMD \"$OLDNAME\""
+  fi 
+ fi 
+ write_log "$CHKMD5MSG"
+ MD5ERROR=0 
+ SKIPCOPY=0
+}
+
+if [[ ! -z ${1:-""} ]]; then 
+	if [[ -f "$1" ]]; then 
+	 TARGETFILE="$1" 
+     TARGETFILE=$(echo "$TARGETFILE" | sed "s#^[^/]#$(pwd)/&#")
+	  (($(file "$TARGETFILE"| grep -c PDF))) && process_file "$TARGETFILE" 
+	elif [[ -d "$1" ]]; then 
+	 TARGETDIR="$1" 
+     TARGETDIR=$(echo "$TARGETDIR" | sed "s#^[^/]#$(pwd)/&#;s/\.$//")
+	 for a in "${TARGETDIR%/}/"*; do 
+	  (($(file "$a"| grep -c PDF))) && process_file "$a" 
+	 done 
+	else 
+	 ## if it doesn't start with a -, then the user is probably not trying for an option  
+	 [[ ! "$1" =~ ^- ]] || [[ $# -eq 0 ]] && echo "ren_pdf2title::** ERROR File/Directory not found: $1" 
+	 [[ ! "$1" =~ --help ]] || [[ $# -eq 0 ]] && print_usage || print_help
+	fi 
+else 
+  print_usage
+fi 
+
+grace_exit

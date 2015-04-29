@@ -1,4 +1,37 @@
-#!/bin/bash 
+#!/usr/bin/env bash 
+
+#############################################################################
+###########################################################################
+### Created by A.M.Danischewski (c) 2015 v1.1
+### Issues: If you find any issues emai1 me at my <first name> dot 
+###         <my last name> at gmail dot com.  
+###
+### Uses the utility pdfinfo to parse a pdf file for its meta database 
+### and renames the file using the Title or substring of the Title. 
+### 
+### This utility will *not* automatically delete the old pdf files, it will 
+### generate a rm script that will and you can review it prior to executing. 
+### 
+### In addition, this utility will check md5 sums to make sure that no file 
+### is clobbered and that all files are copied over successfully.    
+###  
+### This program requires (to work to full capacity) by default: 
+###   poppler-utils  html2text
+###
+### This program is free software: you can redistribute it and/or modify
+### it under the terms of the GNU General Public License as published by
+### the Free Software Foundation, either version 3 of the License, or
+### (at your option) any later version.
+###
+### This program is distributed in the hope that it will be useful,
+### but WITHOUT ANY WARRANTY; without even the implied warranty of
+### MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+### GNU General Public License for more details.
+###
+### You should have received a copy of the GNU General Public License
+### along with this program.  If not, see <http://www.gnu.org/licenses/>.
+###########################################################################
+#############################################################################
 
 declare -r BASHERREXIT="-e" ## reset state if it needs to be toggled elsewhere 
                             ## +e turns off shell error on exit, -e turns it on   
@@ -84,8 +117,9 @@ Eg. ren_pdf2title /tmp/234972842.pdf
     
     Done!   
 
-Requirements: pdfinfo, pdftohtml (found in poppler-utils, e.g. apt-get install poppler-utils) 
-              html2text 
+Requirements: html2text, poppler-utils  
+              sudo apt-get install poppler-utils
+              sudo apt-get install html2text 
 EOF
 grace_exit 
 }
@@ -118,7 +152,7 @@ function get_ocr_title() {
       ## LANG=C sed 's/[\x80-\xFF]//g' strips out multibyte characters, the LANG=C (or other) is essential  
       ## sed 's/[^a-Z0-9 .-\_]*/ /g' rids all single byte characters except for a-z, A-Z, 0-9, ., -, _ or a blank space 
       ## if you see sed throw an "Invalid range end" it probably means your LANG variable is no good, try setting it to en_US.UTF-8 (export LANG=en_US.UTF-8)    
-   OCRTITLE=$(html2text <(cat "$TMPDIR/${FILENAME%.pdf}"s.html | head -20) | tr '\n' ' ' | sed 's/[^a-Z0-9_-]/ /g' | LANG=C sed 's/[\x80-\xFF]//g' | tr -s ' ' | sed 's/ /_/g' | cut -c -250 | sed 's/\(^.*[lL][aA][Tt][eE][Xx]\)\(.*\)/\2/g' | cut -c -75 | sed 's/^_//;s/_$//')
+   OCRTITLE=$(html2text "$TMPDIR/${FILENAME%.pdf}s.html" | head -20 | tr '\n' ' ' | sed 's/[^a-Z0-9_-]/ /g' | LANG=C sed 's/[\x80-\xFF]//g' | tr -s ' ' | sed 's/ /_/g' | cut -c -250 | sed 's/\(^.*[lL][aA][Tt][eE][Xx]\)\(.*\)/\2/g' | cut -c -75 | sed 's/^_//;s/_$//')
 #  OCRTITLE=$(html2text <(cat "${1%.pdf}"s.html | head -20) | tr '\n' ' ' | sed 's/[^a-Z0-9_-]/ /g' | tr -s ' ' | sed 's/ /_/g' | cut -c -250 | sed 's/\(^.*[lL][aA][Tt][eE][Xx]\)\(.*\)/\2/g' | cut -c -75 | sed 's/^_//;s/_$//')
 # OCRTITLE=$(html2text <(cat "${1%.pdf}"s.html | head -20) | tr '\n' ' ' | sed 's/[^a-Z0-9_-]/ /g' | tr -s ' ' | cut -c -75 | sed 's/ /_/g')  
 # OCRTITLE=$(html2text <(cat "${1%.pdf}"s.html | head -15) | cut -c -75 | sed 's/[^a-Z0-9_-]/ /g' | tr -s ' ' | sed 's/ /_/g')
